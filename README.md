@@ -1,4 +1,3 @@
-rp
-==
+# rp
 
-A simple reverse proxy.
+An HTTP experiment.
