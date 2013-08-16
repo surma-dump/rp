@@ -4,121 +4,137 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/streadway/handy/report"
-	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"strings"
+	"reflect"
 )
 
-func unmarshalHandler(submap map[string]interface{}) (http.Handler, error) {
-	if len(submap) <= 0 {
-		return nil, fmt.Errorf("no handler declared")
-	}
-	if len(submap) > 1 {
-		return nil, fmt.Errorf("multiple handlers declared")
-	}
-	for k, v := range submap {
-		buf, err := json.Marshal(v)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %s", k, err)
-		}
+type HandlerFactory func(p []byte) (http.Handler, error)
 
-		switch k {
-		case "file_server":
-			var h fileServer
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		case "redirect":
-			var h redirect
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		case "handy_report":
-			var h handyReport
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		case "simple_log":
-			var h simpleLog
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		case "basic_auth":
-			var h basicAuth
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		case "simple_code":
-			var h simpleCode
-			if err := json.Unmarshal(buf, &h); err != nil {
-				return nil, fmt.Errorf("%s: %s", k, err)
-			}
-			return h, nil
-
-		default:
-			return nil, fmt.Errorf("invalid handler '%s'", k)
-		}
-	}
-	panic("impossible")
+type HandlerCollection interface {
+	LookupHandler(name string) HandlerFactory
+	GenerateFromJSON(map[string]interface{}) (http.Handler, error)
 }
 
-type simpleCode int
+type DefaultHandlerCollection struct{}
 
-func (h *simpleCode) UnmarshalJSON(p []byte) error {
+func (h *DefaultHandlerCollection) GenerateFromJSON(json map[string]interface{}) (http.Handler, error) {
+	if len(json) <= 0 || len(json) > 1 {
+		return nil, fmt.Errorf("Invalid number of handler")
+	}
+
+	handlerName, data := extractKey(json)
+	hf := h.LookupHandler(handlerName)
+	if hf == nil {
+		return nil, fmt.Errorf("Unknown handler %s", handlerName)
+	}
+
+	return hf(mustMarshal(data))
+}
+
+func mustMarshal(v interface{}) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic("Did not marshal")
+	}
+	return data
+}
+
+func extractKey(m map[string]interface{}) (string, interface{}) {
+	for k, v := range m {
+		return k, v
+	}
+	panic("Should not happen")
+}
+
+func (h *DefaultHandlerCollection) LookupHandler(name string) HandlerFactory {
+	// Because security
+	if name == "LookupHandler" {
+		return nil
+	}
+	v := reflect.ValueOf(h)
+	if _, ok := v.Type().MethodByName(name); !ok {
+		return nil
+	}
+	hf, ok := v.MethodByName(name).Interface().(func([]byte) (http.Handler, error))
+	if !ok {
+		return nil
+	}
+	return hf
+}
+
+func (h *DefaultHandlerCollection) SimpleCode(p []byte) (http.Handler, error) {
 	var x int
 	if err := json.Unmarshal(p, &x); err != nil {
-		return err
+		return nil, err
 	}
-	*h = simpleCode(x)
-	return nil
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(x))
+		w.Write([]byte(http.StatusText(int(x))))
+	}), nil
 }
 
-func (h simpleCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(int(h))
-	w.Write([]byte(http.StatusText(int(h))))
-}
-
-type fileServer struct {
-	root string
-}
-
-func (h *fileServer) UnmarshalJSON(p []byte) error {
+func (h *DefaultHandlerCollection) FileServer(p []byte) (http.Handler, error) {
 	var x struct {
 		Root string `json:"root"`
 	}
 	if err := json.Unmarshal(p, &x); err != nil {
-		return err
+		return nil, err
 	}
 
 	fi, err := os.Stat(x.Root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !fi.IsDir() {
-		return os.ErrInvalid
+		return nil, os.ErrInvalid
 	}
 
-	h.root = x.Root
-	return nil
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.FileServer(http.Dir(x.Root)).ServeHTTP(w, r)
+	}), nil
 }
 
-func (h fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	http.FileServer(http.Dir(h.root)).ServeHTTP(w, r)
+func (h *DefaultHandlerCollection) BasicAuth(p []byte) (http.Handler, error) {
+	var x struct {
+		Realm string                 `json:"realm"`
+		User  string                 `json:"user"`
+		Pass  string                 `json:"pass"`
+		Next  map[string]interface{} `json:"next"`
+	}
+	if err := json.Unmarshal(p, &x); err != nil {
+		return nil, err
+	}
+	if x.Realm == "" {
+		x.Realm = "authorization"
+	}
+	if x.User == "" {
+		return nil, fmt.Errorf("basic_auth: 'user' required")
+	}
+	if x.Pass == "" {
+		return nil, fmt.Errorf("basic_auth: 'pass' required")
+	}
+	next, err := h.GenerateFromJSON(x.Next)
+	if err != nil {
+		return nil, fmt.Errorf("basic_auth: 'next': %s", err)
+	}
+
+	s := fmt.Sprintf("%s:%s", x.User, x.Pass)
+	encoded := base64.StdEncoding.EncodeToString([]byte(s))
+	authorization := "Basic " + encoded
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a := r.Header.Get("Authorization"); a == "" || a != authorization {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, x.Realm))
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}), nil
 }
 
+/*
 type redirect struct {
 	to   string
 	code int // default: http.StatusMovedPermanently
@@ -254,3 +270,4 @@ func (h basicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.next.ServeHTTP(w, r)
 }
+*/

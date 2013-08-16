@@ -23,9 +23,9 @@ func main() {
 	}
 	defer f.Close()
 
-
-
-	c := configuration{}
+	c := &configuration{
+		HandlerCollection: &DefaultHandlerCollection{},
+	}
 	if err := json.NewDecoder(f).Decode(&c); err != nil {
 		log.Fatal(err)
 	}
@@ -35,20 +35,29 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listen, nil))
 }
 
-type configuration map[string]http.Handler
+type configuration struct {
+	HandlerCollection HandlerCollection
+	handlerMap        map[string]http.Handler
+}
 
-func (c configuration) UnmarshalJSON(p []byte) error {
+func (c *configuration) UnmarshalJSON(p []byte) error {
 	var m map[string]map[string]interface{}
 	if err := json.Unmarshal(p, &m); err != nil {
 		return err
 	}
+	c.handlerMap = make(map[string]http.Handler)
+
 	for hosts, submap := range m {
-		handler, err := unmarshalHandler(submap)
+		if len(submap) <= 0 || len(submap) > 1 {
+			return fmt.Errorf("Invalid number of handlers for host %s", hosts)
+		}
+
+		handler, err := c.HandlerCollection.GenerateFromJSON(submap)
 		if err != nil {
 			return fmt.Errorf("%s: %s", hosts, err)
 		}
 		for _, host := range strings.Split(hosts, ",") {
-			c[host] = handler
+			c.handlerMap[host] = handler
 		}
 	}
 	return nil
@@ -57,7 +66,7 @@ func (c configuration) UnmarshalJSON(p []byte) error {
 func (c configuration) install(mux *http.ServeMux) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		host := strings.Split(r.Host, ":")[0]
-		h, ok := c[host]
+		h, ok := c.handlerMap[host]
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
